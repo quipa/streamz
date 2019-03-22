@@ -209,9 +209,8 @@ class _DataFrameMixin(object):
     def __dir__(self):
         o = set(dir(type(self)))
         o.update(self.__dict__)
-        o.update(c for c in self.columns if
-                 (isinstance(c, pd.compat.string_types) and
-                 pd.compat.isidentifier(c)))
+        o.update(c for c in self.columns
+                 if (isinstance(c, pd.compat.string_types) and pd.compat.isidentifier(c)))
         return list(o)
 
     def assign(self, **kwargs):
@@ -707,9 +706,8 @@ class WindowedGroupBy(GroupBy):
 
 def _random_df(tup):
     last, now, freq = tup
-    index = pd.DatetimeIndex(start=(last + freq.total_seconds()) * 1e9,
-                             end=now * 1e9,
-                             freq=freq)
+    index = pd.date_range(start=(last + freq.total_seconds()) * 1e9,
+                          end=now * 1e9, freq=freq)
 
     df = pd.DataFrame({'x': np.random.random(len(index)),
                        'y': np.random.poisson(size=len(index)),

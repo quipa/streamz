@@ -15,6 +15,11 @@ from tornado import gen
 from tornado.locks import Condition
 from tornado.ioloop import IOLoop
 from tornado.queues import Queue
+try:
+    from tornado.ioloop import PollIOLoop
+except ImportError:
+    PollIOLoop = None  # dropped in tornado 6.0
+
 from collections import Iterable
 
 from .compatibility import get_thread_identity
@@ -1226,19 +1231,100 @@ class latest(Stream):
             yield self._emit(x)
 
 
+@Stream.register_api()
+class to_kafka(Stream):
+    """ Writes data in the stream to Kafka
+
+    This stream accepts a string or bytes object. Call ``flush`` to ensure all
+    messages are pushed. Responses from Kafka are pushed downstream.
+
+    Parameters
+    ----------
+    topic : string
+        The topic which to write
+    producer_config : dict
+        Settings to set up the stream, see
+        https://docs.confluent.io/current/clients/confluent-kafka-python/#configuration
+        https://github.com/edenhill/librdkafka/blob/master/CONFIGURATION.md
+        Examples:
+        bootstrap.servers: Connection string (host:port) to Kafka
+
+    Examples
+    --------
+    >>> from streamz import Stream
+    >>> ARGS = {'bootstrap.servers': 'localhost:9092'}
+    >>> source = Stream()
+    >>> kafka = source.map(lambda x: str(x)).to_kafka('test', ARGS)
+    <to_kafka>
+    >>> for i in range(10):
+    ...     source.emit(i)
+    >>> kafka.flush()
+    """
+    def __init__(self, upstream, topic, producer_config, **kwargs):
+        import confluent_kafka as ck
+
+        self.topic = topic
+        self.producer = ck.Producer(producer_config)
+
+        Stream.__init__(self, upstream, ensure_io_loop=True, **kwargs)
+        self.stopped = False
+        self.polltime = 0.2
+        self.loop.add_callback(self.poll)
+        self.futures = []
+
+    @gen.coroutine
+    def poll(self):
+        while not self.stopped:
+            # executes callbacks for any delivered data, in this thread
+            # if no messages were sent, nothing happens
+            self.producer.poll(0)
+            yield gen.sleep(self.polltime)
+
+    def update(self, x, who=None):
+        future = gen.Future()
+        self.futures.append(future)
+
+        @gen.coroutine
+        def _():
+            while True:
+                try:
+                    # this runs asynchronously, in C-K's thread
+                    self.producer.produce(self.topic, x, callback=self.cb)
+                    return
+                except BufferError:
+                    yield gen.sleep(self.polltime)
+                except Exception as e:
+                    future.set_exception(e)
+                    return
+
+        self.loop.add_callback(_)
+        return future
+
+    @gen.coroutine
+    def cb(self, err, msg):
+        future = self.futures.pop(0)
+        if msg is not None and msg.value() is not None:
+            future.set_result(None)
+            yield self._emit(msg.value())
+        else:
+            future.set_exception(err or msg.error())
+
+    def flush(self, timeout=-1):
+        self.producer.flush(timeout)
+
+
 def sync(loop, func, *args, **kwargs):
     """
     Run coroutine in loop running in separate thread.
     """
     # This was taken from distrbuted/utils.py
-    timeout = kwargs.pop('callback_timeout', None)
 
-    def make_coro():
-        coro = gen.maybe_future(func(*args, **kwargs))
-        if timeout is None:
-            return coro
-        else:
-            return gen.with_timeout(timedelta(seconds=timeout), coro)
+    # Tornado's PollIOLoop doesn't raise when using closed, do it ourselves
+    if PollIOLoop and ((isinstance(loop, PollIOLoop) and getattr(loop, '_closing', False))
+            or (hasattr(loop, 'asyncio_loop') and loop.asyncio_loop._closed)):
+        raise RuntimeError("IOLoop is closed")
+
+    timeout = kwargs.pop('callback_timeout', None)
 
     e = threading.Event()
     main_tid = get_thread_identity()
@@ -1252,17 +1338,23 @@ def sync(loop, func, *args, **kwargs):
                 raise RuntimeError("sync() called from thread of running loop")
             yield gen.moment
             thread_state.asynchronous = True
-            result[0] = yield make_coro()
-        except Exception as exc:
-            logger.exception(exc)
+            future = func(*args, **kwargs)
+            if timeout is not None:
+                future = gen.with_timeout(timedelta(seconds=timeout), future)
+            result[0] = yield future
+        except Exception:
             error[0] = sys.exc_info()
         finally:
             thread_state.asynchronous = False
             e.set()
 
     loop.add_callback(f)
-    while not e.is_set():
-        e.wait(1000000)
+    if timeout is not None:
+        if not e.wait(timeout):
+            raise gen.TimeoutError("timed out after %s s." % (timeout,))
+    else:
+        while not e.is_set():
+            e.wait(10)
     if error[0]:
         six.reraise(*error[0])
     else:

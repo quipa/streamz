@@ -1,6 +1,5 @@
 from glob import glob
 import os
-import weakref
 
 import time
 import tornado.ioloop
@@ -149,6 +148,142 @@ class filenames(Source):
 
 
 @Stream.register_api(staticmethod)
+class from_tcp(Source):
+    """
+    Creates events by reading from a socket using tornado TCPServer
+
+    The stream of incoming bytes is split on a given delimiter, and the parts
+    become the emitted events.
+
+    Parameters
+    ----------
+    port : int
+        The port to open and listen on. It only gets opened when the source
+        is started, and closed upon ``stop()``
+    delimiter : bytes
+        The incoming data will be split on this value. The resulting events
+        will still have the delimiter at the end.
+    start : bool
+        Whether to immediately initiate the source. You probably want to
+        set up downstream nodes first.
+    server_kwargs : dict or None
+        If given, additional arguments to pass to TCPServer
+
+    Example
+    -------
+
+    >>> source = Source.from_tcp(4567)  # doctest: +SKIP
+    """
+    def __init__(self, port, delimiter=b'\n', start=False,
+                 server_kwargs=None):
+        super(from_tcp, self).__init__(ensure_io_loop=True)
+        self.stopped = True
+        self.server_kwargs = server_kwargs or {}
+        self.port = port
+        self.server = None
+        self.delimiter = delimiter
+        if start:  # pragma: no cover
+            self.start()
+
+    @gen.coroutine
+    def _start_server(self):
+        from tornado.tcpserver import TCPServer
+        from tornado.iostream import StreamClosedError
+
+        class EmitServer(TCPServer):
+            source = self
+
+            @gen.coroutine
+            def handle_stream(self, stream, address):
+                while True:
+                    try:
+                        data = yield stream.read_until(self.source.delimiter)
+                        yield self.source._emit(data)
+                    except StreamClosedError:
+                        break
+
+        self.server = EmitServer(**self.server_kwargs)
+        self.server.listen(self.port)
+
+    def start(self):
+        if self.stopped:
+            self.loop.add_callback(self._start_server)
+            self.stopped = False
+
+    def stop(self):
+        if not self.stopped:
+            self.server.stop()
+            self.server = None
+            self.stopped = True
+
+
+@Stream.register_api(staticmethod)
+class from_http_server(Source):
+    """Listen for HTTP POSTs on given port
+
+    Each connection will emit one event, containing the body data of
+    the request
+
+    Parameters
+    ----------
+    port : int
+        The port to listen on
+    path : str
+        Specific path to listen on. Can be regex, but content is not used.
+    start : bool
+        Whether to immediately startup the server. Usually you want to connect
+        downstream nodes first, and then call ``.start()``.
+    server_kwargs : dict or None
+        If given, set of further parameters to pass on to HTTPServer
+
+    Example
+    -------
+    >>> source = Source.from_http_server(4567)  # doctest: +SKIP
+    """
+
+    def __init__(self, port, path='/.*', start=False, server_kwargs=None):
+        self.port = port
+        self.path = path
+        self.server_kwargs = server_kwargs or {}
+        super(from_http_server, self).__init__(ensure_io_loop=True)
+        self.stopped = True
+        self.server = None
+        if start:  # pragma: no cover
+            self.start()
+
+    def _start_server(self):
+        from tornado.web import Application, RequestHandler
+        from tornado.httpserver import HTTPServer
+
+        class Handler(RequestHandler):
+            source = self
+
+            @gen.coroutine
+            def post(self):
+                yield self.source._emit(self.request.body)
+                self.write('OK')
+
+        application = Application([
+            (self.path, Handler),
+        ])
+        self.server = HTTPServer(application, **self.server_kwargs)
+        self.server.listen(self.port)
+
+    def start(self):
+        """Start HTTP server and listen"""
+        if self.stopped:
+            self.loop.add_callback(self._start_server)
+            self.stopped = False
+
+    def stop(self):
+        """Shutdown HTTP server"""
+        if not self.stopped:
+            self.server.stop()
+            self.server = None
+            self.stopped = True
+
+
+@Stream.register_api(staticmethod)
 class from_kafka(Source):
     """ Accepts messages from Kafka
 
@@ -180,8 +315,7 @@ class from_kafka(Source):
     ...           {'bootstrap.servers': 'localhost:9092',
     ...            'group.id': 'streamz'})  # doctest: +SKIP
     """
-    def __init__(self, topics, consumer_params, poll_interval=0.1, start=False,
-                 **kwargs):
+    def __init__(self, topics, consumer_params, poll_interval=0.1, start=False, **kwargs):
         self.cpars = consumer_params
         self.consumer = None
         self.topics = topics
@@ -194,7 +328,7 @@ class from_kafka(Source):
     def do_poll(self):
         if self.consumer is not None:
             msg = self.consumer.poll(0)
-            if msg and msg.value():
+            if msg and msg.value() and msg.error() is None:
                 return msg.value()
 
     @gen.coroutine
@@ -207,26 +341,19 @@ class from_kafka(Source):
                 yield gen.sleep(self.poll_interval)
             if self.stopped:
                 break
+        self._close_consumer()
 
     def start(self):
         import confluent_kafka as ck
-        import distributed
         if self.stopped:
-            finalize = distributed.compatibility.finalize
             self.stopped = False
-            self.loop.add_callback(self.poll_kafka)
             self.consumer = ck.Consumer(self.cpars)
             self.consumer.subscribe(self.topics)
+            tp = ck.TopicPartition(self.topics[0], 0, 0)
 
-            def close(ref):
-                ob = ref()
-                if ob is not None and ob.consumer is not None:
-                    consumer = ob.consumer
-                    ob.consumer = None
-                    consumer.unsubscribe()
-                    consumer.close()  # may raise with latest ck, that's OK
-
-            finalize(self, close, weakref.ref(self))
+            # blocks for consumer thread to come up
+            self.consumer.get_watermark_offsets(tp)
+            self.loop.add_callback(self.poll_kafka)
 
     def _close_consumer(self):
         if self.consumer is not None:
@@ -253,24 +380,23 @@ class FromKafkaBatched(Stream):
     @gen.coroutine
     def poll_kafka(self):
         import confluent_kafka as ck
-        consumer = ck.Consumer(self.consumer_params)
 
         try:
             while not self.stopped:
                 out = []
-
                 for partition in range(self.npartitions):
                     tp = ck.TopicPartition(self.topic, partition, 0)
                     try:
-                        low, high = consumer.get_watermark_offsets(tp,
-                                                                   timeout=0.1)
+                        low, high = self.consumer.get_watermark_offsets(
+                            tp, timeout=0.1)
                     except (RuntimeError, ck.KafkaException):
                         continue
                     current_position = self.positions[partition]
                     lowest = max(current_position, low)
-                    out.append((self.consumer_params, self.topic, partition,
-                                lowest, high - 1))
-                    self.positions[partition] = high
+                    if high > lowest:
+                        out.append((self.consumer_params, self.topic, partition,
+                                    lowest, high - 1))
+                        self.positions[partition] = high
 
                 for part in out:
                     yield self._emit(part)
@@ -278,11 +404,19 @@ class FromKafkaBatched(Stream):
                 else:
                     yield gen.sleep(self.poll_interval)
         finally:
-            consumer.close()
+            self.consumer.unsubscribe()
+            self.consumer.close()
 
     def start(self):
-        self.stopped = False
-        self.loop.add_callback(self.poll_kafka)
+        import confluent_kafka as ck
+        if self.stopped:
+            self.consumer = ck.Consumer(self.consumer_params)
+            self.stopped = False
+            tp = ck.TopicPartition(self.topic, 0, 0)
+
+            # blocks for consumer thread to come up
+            self.consumer.get_watermark_offsets(tp)
+            self.loop.add_callback(self.poll_kafka)
 
 
 @Stream.register_api(staticmethod)
@@ -352,7 +486,7 @@ def get_message_batch(kafka_params, topic, partition, low, high, timeout=None):
     try:
         while True:
             msg = consumer.poll(0)
-            if msg and msg.value():
+            if msg and msg.value() and msg.error() is None:
                 if high >= msg.offset():
                     out.append(msg.value())
                 if high <= msg.offset():
